@@ -16,11 +16,15 @@ struct AdditionalUserData {
 	let featureFlaggingID: UUID
 }
 
+struct NoFeatureFlaggingID: Error {
+    let record: CKRecord
+}
+
 extension AdditionalUserData {
-	init?(record: CKRecord) {
+	init(record: CKRecord) throws {
 		guard let featureFlagIDString = record[.userFeatureFlaggingID] as? String,
 			  let uuid = UUID(uuidString: featureFlagIDString) else {
-			return nil
+			throw NoFeatureFlaggingID(record: record)
 		}
 		self.featureFlaggingID = uuid
 	}

@@ -9,65 +9,69 @@ import Foundation
 import CloudKit
 import Combine
 
+extension Publisher where Failure == Error {
+
+    /// Handles a specific error type from an upstream publisher by replacing it
+    /// with another publisher.
+    ///
+    /// - Parameters:
+    ///   - type: The type of error to handle.
+    ///   - handler: A closure that accepts the upstream failure as input and
+    ///              returns a publisher to replace the upstream publisher.
+    /// - Returns: A publisher that handles errors of the given type from an
+    ///            upstream publisher by replacing the failed publisher with
+    ///            another publisher.
+    public func `catch`<F: Error, P: Publisher>(
+        _ type: F.Type,
+        _ handler: @escaping (F) -> P
+    ) -> Publishers.TryCatch<Self, P> where P.Output == Output {
+        tryCatch { error in
+            guard let failure = error as? F else { throw error }
+            return handler(failure)
+        }
+    }
+}
+
 class FeatureFlagCoordinator {
 
 	let container: Container
 	//TODO: make this a store that's updated from CK subscription
-	private let featureFlagsFuture: Future<[String: FeatureFlag], Error>
-	private let userDataFuture: Future<AdditionalUserData, Error>
+	private let featureFlags: AnyPublisher<[String: FeatureFlag], Error>
+	private let userData: AnyPublisher<AdditionalUserData, Error>
 
 	init(container: Container) {
 		self.container = container
-		self.userDataFuture = Future<AdditionalUserData, Error> { (promise) in
-			container.fetchUserRecordID { (recordID, error) in
-				guard let recordID = recordID else {
-					//TODO: Fix
-					promise(.failure(error!))
-					return
-				}
-				container.featureFlaggingDatabase.fetch(withRecordID: recordID) { (record, error) in
-					guard let record = record else {
-						//TODO: Fix
-						promise(.failure(error!))
-						return
-					}
-					guard let data = AdditionalUserData(record: record) else {
-						/// User doesn't have an ID set
-						record[.userFeatureFlaggingID] = UUID().uuidString
-						container.featureFlaggingDatabase.save(record) { (record, error) in
-							guard let record = record, let data = AdditionalUserData(record: record) else {
-								//TODO: Fix
-								promise(.failure(error!))
-								return
-							}
-							promise(.success(data))
-						}
-						return
-					}
-					promise(.success(data))
-				}
-			}
-		}
+        let database = container.featureFlaggingDatabase
 
-		self.featureFlagsFuture = Future { (promise) in
-			let query = CKQuery(recordType: "FeatureFlag", predicate: NSPredicate(value: true))
+        func createFeatureFlaggingID(_ record: CKRecord) -> AnyPublisher<AdditionalUserData, Error> {
+            record[.userFeatureFlaggingID] = UUID().uuidString
+            return database
+                .save(record: record)
+                .tryMap(AdditionalUserData.init)
+                .eraseToAnyPublisher()
+        }
 
-			container.featureFlaggingDatabase.perform(query, inZoneWith: nil) { (records, error) in
-				guard let records = records else {
-					//TODO: Fix
-					promise(.failure(error!))
-					return
-				}
-				let flags = records.compactMap(FeatureFlag.init).reduce(into: [:], { (dict, flag) in
-					dict[flag.name] = flag
-				})
-				promise(.success(flags))
-			}
-		}
+        userData = container
+            .userRecordID
+            .flatMap(database.record(for:))
+            .tryMap(AdditionalUserData.init)
+            .catch(NoFeatureFlaggingID.self) { createFeatureFlaggingID($0.record) }
+            .eraseToAnyPublisher()
+
+        let query = CKQuery(recordType: "FeatureFlag", predicate: NSPredicate(value: true))
+        featureFlags = database
+            .records(matching: query, inZoneWith: nil)
+            .mapError { $0 as Error }
+            .map {
+                $0.compactMap(FeatureFlag.init).reduce(into: [:]) { dict, flag in
+                    dict[flag.name] = flag
+                }
+            }
+            .eraseToAnyPublisher()
 	}
 
 	@discardableResult func featureEnabled(name: String) -> AnyPublisher<Bool, Error> {
-		Publishers.CombineLatest(featureFlagsFuture, userDataFuture).map { (dict, userData) -> Bool in
+		Publishers.CombineLatest(featureFlags, userData).map { (dict, userData) -> Bool in
 			guard let ff = dict[name] else {
 				return false
 			}
